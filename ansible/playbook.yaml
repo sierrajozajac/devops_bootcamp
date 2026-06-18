@@ -1,0 +1,408 @@
+---
+# =============================================================================
+# Hybrid CI/CD provisioning: Jenkins + Nexus + Docker + IaC tooling
+# Target group: cicd_servers (Debian/Ubuntu family)
+# =============================================================================
+- name: Configure Hybrid Jenkins and Nexus Automation Engine
+  hosts: cicd_servers
+  become: true
+  gather_facts: true
+
+  # ---------------------------------------------------------------------------
+  # Versions / paths pinned in one place so upgrades are a one-line change
+  # ---------------------------------------------------------------------------
+  vars:
+    jdk_version: "21"
+    nexus_version: "3.87.1-01"
+    k8s_minor: "v1.30"
+
+    nexus_install_dir: "/opt/nexus-{{ nexus_version }}"
+    nexus_symlink: "/opt/nexus-engine"
+    nexus_work_dir: "/opt/sonatype-work"
+    keyring_dir: "/usr/share/keyrings"
+
+    # Nexus defaults to a 2.7 GB heap, which OOM-kills it when Jenkins also
+    # runs on a small box. Cap it so both JVMs fit (tune up if you resize).
+    nexus_heap: "1200m"
+
+    # Cap the Jenkins JVM too so Jenkins + Nexus + builds stay within RAM.
+    jenkins_heap: "1024m"
+
+    # Swap gives the box headroom so the kernel doesn't OOM-kill a JVM when
+    # Jenkins + Nexus spike together. Sized for a ~4 GB instance.
+    swap_file: /swapfile
+    swap_size: "2G"
+
+    # Docker connector port of the Nexus 'docker (hosted)' repo (Step 4.1).
+    # The registry host defaults to this box's primary IP since Nexus runs
+    # here; override nexus_registry_host if Nexus lives elsewhere.
+    nexus_docker_port: 8082
+    nexus_registry_host: "{{ ansible_facts['default_ipv4']['address'] }}"
+    nexus_registry: "{{ nexus_registry_host }}:{{ nexus_docker_port }}"
+
+  # ---------------------------------------------------------------------------
+  # Handlers: services only bounce when something they depend on actually
+  # changed (keeps the run idempotent and avoids needless restarts)
+  # ---------------------------------------------------------------------------
+  handlers:
+    - name: Restart Jenkins
+      ansible.builtin.systemd:
+        name: jenkins
+        state: restarted
+        daemon_reload: true
+
+    - name: Restart Docker
+      ansible.builtin.systemd:
+        name: docker
+        state: restarted
+
+    - name: Restart Nexus
+      ansible.builtin.systemd:
+        name: nexus
+        state: restarted
+
+  tasks:
+    # =========================================================================
+    # BASE SYSTEM
+    # =========================================================================
+    - name: Update apt cache and upgrade all packages
+      ansible.builtin.apt:
+        update_cache: true
+        upgrade: dist
+        cache_valid_time: 3600
+
+    - name: Install essential system prerequisites
+      ansible.builtin.apt:
+        name:
+          - curl
+          - wget
+          - apt-transport-https
+          - ca-certificates
+          - gnupg
+          - software-properties-common
+          - unzip
+          - git
+        state: present
+
+    - name: Ensure apt keyring directory exists
+      ansible.builtin.file:
+        path: "{{ keyring_dir }}"
+        state: directory
+        mode: '0755'
+
+    # -------------------------------------------------------------------------
+    # SWAP: prevents OOM kills when Jenkins + Nexus run on a small box.
+    # 'creates' makes file creation run once; mkswap/swapon only fire on
+    # first creation, and fstab keeps it enabled across reboots.
+    # -------------------------------------------------------------------------
+    - name: Allocate swap file
+      ansible.builtin.command: "fallocate -l {{ swap_size }} {{ swap_file }}"
+      args:
+        creates: "{{ swap_file }}"
+      register: swap_allocated
+
+    - name: Secure swap file permissions
+      ansible.builtin.file:
+        path: "{{ swap_file }}"
+        owner: root
+        group: root
+        mode: '0600'
+
+    - name: Format the swap file
+      ansible.builtin.command: "mkswap {{ swap_file }}"
+      when: swap_allocated.changed
+
+    - name: Persist swap in /etc/fstab
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        line: "{{ swap_file }} none swap sw 0 0"
+        state: present
+
+    - name: Enable swap now
+      ansible.builtin.command: "swapon {{ swap_file }}"
+      when: swap_allocated.changed
+
+    # =========================================================================
+    # JAVA (required by Jenkins)
+    # =========================================================================
+    - name: Install OpenJDK (required for modern Jenkins)
+      ansible.builtin.apt:
+        name: "openjdk-{{ jdk_version }}-jdk"
+        state: present
+
+    - name: Verify Java installation version
+      ansible.builtin.command: java -version
+      register: java_version_output
+      changed_when: false
+
+    - name: Print Java version
+      ansible.builtin.debug:
+        msg: "{{ java_version_output.stderr_lines }}"
+
+    # =========================================================================
+    # JENKINS
+    # =========================================================================
+    - name: Download Jenkins official GPG key
+      ansible.builtin.get_url:
+        url: https://pkg.jenkins.io/debian-stable/jenkins.io-2026.key
+        dest: /tmp/jenkins.key
+        mode: '0644'
+
+    # De-armor only when the keyring is missing -> idempotent (no re-run churn)
+    - name: De-armor Jenkins GPG key for apt usage
+      ansible.builtin.shell: >
+        gpg --yes --dearmor < /tmp/jenkins.key
+        > {{ keyring_dir }}/jenkins-keyring.gpg
+      args:
+        creates: "{{ keyring_dir }}/jenkins-keyring.gpg"
+
+    - name: Add Jenkins official repository to sources list
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by={{ keyring_dir }}/jenkins-keyring.gpg] https://pkg.jenkins.io/debian-stable binary/"
+        filename: jenkins
+        state: present
+
+    - name: Install Jenkins package
+      ansible.builtin.apt:
+        name: jenkins
+        state: present
+
+    - name: Ensure Jenkins service is started and enabled on boot
+      ansible.builtin.systemd:
+        name: jenkins
+        state: started
+        enabled: true
+
+    # Cap the Jenkins heap via a systemd drop-in (survives package upgrades,
+    # unlike editing the shipped unit file). Restart picks up the new JAVA_OPTS.
+    - name: Create systemd drop-in directory for Jenkins
+      ansible.builtin.file:
+        path: /etc/systemd/system/jenkins.service.d
+        state: directory
+        mode: '0755'
+
+    - name: Cap Jenkins JVM heap via systemd drop-in
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/jenkins.service.d/override.conf
+        mode: '0644'
+        content: |
+          [Service]
+          Environment="JAVA_OPTS=-Xms512m -Xmx{{ jenkins_heap }}"
+      notify: Restart Jenkins
+
+    - name: Wait for Jenkins to generate the initial admin password
+      ansible.builtin.wait_for:
+        path: /var/lib/jenkins/secrets/initialAdminPassword
+        delay: 5
+        timeout: 60
+
+    - name: Retrieve Jenkins initial admin password
+      ansible.builtin.command: cat /var/lib/jenkins/secrets/initialAdminPassword
+      register: jenkins_admin_password
+      changed_when: false
+
+    - name: Print Jenkins initial admin password
+      ansible.builtin.debug:
+        msg: "Your Jenkins Unlock Key is: {{ jenkins_admin_password.stdout }}"
+
+    # =========================================================================
+    # NEXUS
+    # =========================================================================
+    - name: Ensure nexus system group exists
+      ansible.builtin.group:
+        name: nexus
+        state: present
+
+    - name: Create dedicated system user for Nexus
+      ansible.builtin.user:
+        name: nexus
+        group: nexus
+        home: /opt/nexus
+        shell: /bin/bash
+        state: present
+        system: true
+
+    - name: Download stable Nexus OSS distribution archive
+      ansible.builtin.get_url:
+        url: "https://download.sonatype.com/nexus/3/nexus-{{ nexus_version }}-linux-x86_64.tar.gz"
+        dest: /tmp/nexus-{{ nexus_version }}.tar.gz
+        mode: '0644'
+
+    # 'creates' makes extraction run once instead of re-unpacking every play
+    - name: Extract Nexus archive into installation path
+      ansible.builtin.unarchive:
+        src: /tmp/nexus-{{ nexus_version }}.tar.gz
+        dest: /opt/
+        remote_src: true
+        creates: "{{ nexus_install_dir }}"
+
+    - name: Link extracted directory to standard deployment path
+      ansible.builtin.file:
+        src: "{{ nexus_install_dir }}"
+        dest: "{{ nexus_symlink }}"
+        state: link
+
+    - name: Fix ownership across Nexus directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        owner: nexus
+        group: nexus
+        recurse: true
+      loop:
+        - "{{ nexus_install_dir }}"
+        - "{{ nexus_work_dir }}"
+
+    # Cap the JVM heap so Nexus and Jenkins coexist without OOM kills.
+    - name: Cap Nexus JVM heap in nexus.vmoptions
+      ansible.builtin.lineinfile:
+        path: "{{ nexus_install_dir }}/bin/nexus.vmoptions"
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+      loop:
+        - { regexp: '^-Xms', line: '-Xms{{ nexus_heap }}' }
+        - { regexp: '^-Xmx', line: '-Xmx{{ nexus_heap }}' }
+      notify: Restart Nexus
+
+    - name: Create systemd unit service file for Nexus
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/nexus.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=nexus service
+          After=network.target
+
+          [Service]
+          Type=forking
+          LimitNOFILE=65536
+          ExecStart={{ nexus_symlink }}/bin/nexus start
+          ExecStop={{ nexus_symlink }}/bin/nexus stop
+          User=nexus
+          Restart=on-abort
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd, then start and enable Nexus
+      ansible.builtin.systemd:
+        name: nexus
+        state: started
+        enabled: true
+        daemon_reload: true
+
+    # =========================================================================
+    # DOCKER
+    # =========================================================================
+    - name: Install Docker Engine components
+      ansible.builtin.apt:
+        name:
+          - docker.io
+          - docker-compose-v2
+        state: present
+
+    - name: Ensure Docker daemon is started and enabled
+      ansible.builtin.systemd:
+        name: docker
+        state: started
+        enabled: true
+
+    # Step 4.3: trust the Nexus Docker connector over plain HTTP. Rendered
+    # from a dict so the JSON is always valid; restarts Docker only on change.
+    # NOTE: this manages the whole daemon.json. If you add other daemon
+    # options later, fold them into the dict below rather than editing the
+    # file by hand (the next run would overwrite it).
+    - name: Configure Docker insecure-registries for Nexus (Step 4.3)
+      ansible.builtin.copy:
+        dest: /etc/docker/daemon.json
+        mode: '0644'
+        content: "{{ { 'insecure-registries': [nexus_registry] } | to_nice_json }}"
+      notify: Restart Docker
+
+    # Restart Jenkins only when the group membership actually changes
+    - name: Add jenkins system user to the docker group
+      ansible.builtin.user:
+        name: jenkins
+        groups: docker
+        append: true
+      notify: Restart Jenkins
+
+    # =========================================================================
+    # IaC / CLOUD TOOLING (AWS CLI, Terraform, kubectl)
+    # =========================================================================
+    - name: Install AWS CLI v2 via native apt package
+      ansible.builtin.apt:
+        name: awscli
+        state: present
+
+    # --- HashiCorp / Terraform ---
+    - name: Download HashiCorp official ASCII GPG key
+      ansible.builtin.get_url:
+        url: https://apt.releases.hashicorp.com/gpg
+        dest: /tmp/hashicorp.key
+        mode: '0644'
+        force: true
+
+    # De-armor only when the keyring is missing -> idempotent
+    - name: De-armor HashiCorp GPG key to binary format
+      ansible.builtin.shell: >
+        cat /tmp/hashicorp.key | gpg --dearmor
+        > {{ keyring_dir }}/hashicorp-archive-keyring.gpg
+      args:
+        creates: "{{ keyring_dir }}/hashicorp-archive-keyring.gpg"
+
+    - name: Add HashiCorp official repository to sources list
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by={{ keyring_dir }}/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com {{ ansible_facts['distribution_release'] }} main"
+        filename: hashi_repo
+        state: present
+
+    - name: Install Terraform package
+      ansible.builtin.apt:
+        name: terraform
+        state: present
+
+    # --- Kubernetes / kubectl ---
+    - name: Download Kubernetes repository signing ASCII GPG key
+      ansible.builtin.get_url:
+        url: "https://pkgs.k8s.io/core:/stable:/{{ k8s_minor }}/deb/Release.key"
+        dest: /tmp/kubernetes.key
+        mode: '0644'
+        force: true
+
+    # De-armor only when the keyring is missing -> idempotent
+    - name: De-armor Kubernetes GPG key to binary format
+      ansible.builtin.shell: >
+        cat /tmp/kubernetes.key | gpg --dearmor
+        > {{ keyring_dir }}/kubernetes-apt-keyring.gpg
+      args:
+        creates: "{{ keyring_dir }}/kubernetes-apt-keyring.gpg"
+
+    - name: Add Kubernetes official repository to sources list
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by={{ keyring_dir }}/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/{{ k8s_minor }}/deb/ /"
+        filename: kubernetes
+        state: present
+
+    - name: Install kubectl engine package
+      ansible.builtin.apt:
+        name: kubectl
+        state: present
+
+    # =========================================================================
+    # VERIFICATION
+    # =========================================================================
+    - name: Verify installed utility versions
+      ansible.builtin.command: "{{ item }}"
+      loop:
+        - "aws --version"
+        - "terraform -version"
+        - "kubectl version --client"
+      register: tool_versions
+      changed_when: false
+
+    - name: Print utility version details to console log
+      ansible.builtin.debug:
+        msg: "{{ item.stdout if item.stdout != '' else item.stderr }}"
+      loop: "{{ tool_versions.results }}"
+      loop_control:
+        label: "{{ item.item }}"

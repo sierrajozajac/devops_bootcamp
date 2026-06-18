@@ -1,0 +1,31 @@
+# Runs the frontend and backend together.
+#
+# Local dev (no env vars set -> plain image names, build from source):
+#   docker compose up --build      # build images and start both
+#   docker compose down            # stop and remove containers
+#
+# CI deploy (Jenkins exports FRONTEND_IMAGE/BACKEND_IMAGE/IMAGE_TAG -> pulls
+# the exact registry tag instead of rebuilding):
+#   docker compose pull && docker compose up -d
+#
+# frontend -> http://localhost:8080   (nginx serving the React build)
+# backend  -> http://localhost:5000   (gunicorn serving Flask)
+#
+# The two services share a default network, so the frontend can reach the
+# backend at http://backend:5000 from inside the compose network.
+services:
+  frontend:
+    image: "${FRONTEND_IMAGE:-devops-bootcamp-frontend}:${IMAGE_TAG:-latest}"
+    build: ./frontend
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  backend:
+    image: "${BACKEND_IMAGE:-devops-bootcamp-backend}:${IMAGE_TAG:-latest}"
+    build: ./backend
+    ports:
+      - "5000:5000"
+    restart: unless-stopped
