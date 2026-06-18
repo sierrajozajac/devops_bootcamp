@@ -28,6 +28,9 @@
     # Cap the Jenkins JVM too so Jenkins + Nexus + builds stay within RAM.
     jenkins_heap: "1024m"
 
+    # Jenkins temp on the root disk, not the small RAM-backed /tmp tmpfs.
+    jenkins_tmp_dir: /var/lib/jenkins/tmp
+
     # Swap gives the box headroom so the kernel doesn't OOM-kill a JVM when
     # Jenkins + Nexus spike together. Sized for a ~4 GB instance.
     swap_file: /swapfile
@@ -173,21 +176,32 @@
         state: started
         enabled: true
 
-    # Cap the Jenkins heap via a systemd drop-in (survives package upgrades,
-    # unlike editing the shipped unit file). Restart picks up the new JAVA_OPTS.
+    # Move Jenkins' temp dir off the RAM-backed /tmp (a small tmpfs) onto the
+    # root disk. Otherwise the built-in node's free-temp-space monitor trips its
+    # 1 GiB threshold and marks the node offline, so builds never get scheduled.
+    - name: Create Jenkins temp directory on the root disk
+      ansible.builtin.file:
+        path: "{{ jenkins_tmp_dir }}"
+        state: directory
+        owner: jenkins
+        group: jenkins
+        mode: '0750'
+
+    # Cap the Jenkins heap and set java.io.tmpdir via a systemd drop-in (survives
+    # package upgrades, unlike editing the shipped unit). Restart applies it.
     - name: Create systemd drop-in directory for Jenkins
       ansible.builtin.file:
         path: /etc/systemd/system/jenkins.service.d
         state: directory
         mode: '0755'
 
-    - name: Cap Jenkins JVM heap via systemd drop-in
+    - name: Configure Jenkins JVM heap and temp dir via systemd drop-in
       ansible.builtin.copy:
         dest: /etc/systemd/system/jenkins.service.d/override.conf
         mode: '0644'
         content: |
           [Service]
-          Environment="JAVA_OPTS=-Xms512m -Xmx{{ jenkins_heap }}"
+          Environment="JAVA_OPTS=-Xms512m -Xmx{{ jenkins_heap }} -Djava.io.tmpdir={{ jenkins_tmp_dir }}"
       notify: Restart Jenkins
 
     - name: Wait for Jenkins to generate the initial admin password

@@ -17,8 +17,10 @@ services:
   frontend:
     image: "${FRONTEND_IMAGE:-devops-bootcamp-frontend}:${IMAGE_TAG:-latest}"
     build: ./frontend
+    # Host 8080 is taken by Jenkins on the cicd-engine, so default to 8090.
+    # Override with FRONTEND_PORT for local dev if you like.
     ports:
-      - "8080:80"
+      - "${FRONTEND_PORT:-8090}:80"
     depends_on:
       - backend
     restart: unless-stopped
